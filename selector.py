@@ -20,6 +20,7 @@ import gzip
 import json
 import os
 import re
+import select
 import shutil
 import signal
 import subprocess
@@ -418,6 +419,84 @@ def patched_library(maps, text):
     return sources
 
 
+WARM = {"process": None, "broken": False, "cpu": 0.0}
+
+
+def used():
+    """CPU seconds spent on test runs so far."""
+    times = os.times()
+    return times[2] + times[3] + WARM["cpu"]
+
+
+def read_line(process, seconds):
+    ready, _, _ = select.select([process.stdout], [], [], seconds)
+    if not ready:
+        return None
+    return process.stdout.readline().decode("utf-8", "replace").split()
+
+
+def stop_warm():
+    process = WARM["process"]
+    WARM["process"] = None
+    if process is None:
+        return
+    try:
+        process.stdin.close()
+        process.wait(timeout=5)
+    except Exception:  # noqa: BLE001
+        try:
+            process.kill()
+            process.wait(timeout=5)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def warm_run(modules, wanted, report, env):
+    """Runs the tests in a child forked from a process that already holds the
+    heavy third-party imports (see probe/zygote.py). Returns the exit code,
+    or None if the warm process cannot be used and a cold run should be made.
+    """
+    if WARM["broken"]:
+        return None
+    try:
+        if WARM["process"] is None:
+            # Started with no patch applied: each forked child applies its own.
+            env = {key: value for key, value in env.items() if key not in ("BR_PATCH", "BR_REPORT")}
+            WARM["process"] = subprocess.Popen(
+                [sys.executable, os.path.join(PROBE, "zygote.py")],
+                cwd=SRC,
+                env=env,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                bufsize=0,
+            )
+        process = WARM["process"]
+        request = {"patch": json.dumps(modules), "tests": wanted, "report": report}
+        process.stdin.write((json.dumps(request) + "\n").encode())
+        started = read_line(process, 30)
+        if not started or started[0] != "pid":
+            raise RuntimeError("no child")
+        pid = int(started[1])
+        done = read_line(process, PROBE_TIMEOUT)
+        timed_out = done is None
+        if timed_out:
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except OSError:
+                os.kill(pid, signal.SIGKILL)
+            done = read_line(process, 10)
+        if not done or done[0] != "exit":
+            raise RuntimeError("no result")
+        WARM["cpu"] += float(done[2])
+        return -1 if timed_out else int(done[1])
+    except Exception as error:  # noqa: BLE001
+        log("warm process unusable, falling back to cold runs:", repr(error))
+        WARM["broken"] = True
+        stop_warm()
+        return None
+
+
 def run_tests(name, sources, names):
     """Runs tests (by id) against the patched library in a child process.
 
@@ -447,30 +526,32 @@ def run_tests(name, sources, names):
         SKIP_INTEGRATION="0",
         PYTHONDONTWRITEBYTECODE="1",
     )
-    code = -1
-    child = None
-    try:
-        # Its own process group, so worker processes the tests spawn die with it.
-        child = subprocess.Popen(
-            [sys.executable, os.path.join(PROBE, "run_probe.py"), wanted],
-            cwd=SRC,
-            env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-        code = child.wait(timeout=PROBE_TIMEOUT)
-    except Exception as error:  # noqa: BLE001
-        log(name, "test run did not finish:", repr(error))
-    if child is not None:
+    code = warm_run(modules, wanted, report, env)
+    if code is None:  # cold run in a new interpreter
+        code = -1
+        child = None
         try:
-            os.killpg(child.pid, signal.SIGKILL)
-        except OSError:
-            pass
-        try:
-            child.wait(timeout=5)
-        except Exception:  # noqa: BLE001
-            pass
+            # Its own process group, so worker processes the tests spawn die with it.
+            child = subprocess.Popen(
+                [sys.executable, os.path.join(PROBE, "run_probe.py"), wanted],
+                cwd=SRC,
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            code = child.wait(timeout=PROBE_TIMEOUT)
+        except Exception as error:  # noqa: BLE001
+            log(name, "test run did not finish:", repr(error))
+        if child is not None:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            try:
+                child.wait(timeout=5)
+            except Exception:  # noqa: BLE001
+                pass
     failed = []
     if code == 1:
         try:
@@ -508,10 +589,9 @@ def run_overpriced(maps, text, name, chosen, millis, test_ids):
         sources = patched_library(maps, text)
         if sources is None:
             return chosen
-        before = os.times()
+        before = used()
         code, _ = run_tests(name, sources, [ident])
-        after = os.times()
-        spent_cpu = after[2] + after[3] - before[2] - before[3]
+        spent_cpu = used() - before
         verdict = {0: "passed", 1: "failed"}.get(code, "no verdict (%s)" % code)
         log(name, "cpu %.1f" % spent_cpu, "ran", ident.split("::")[-1], "itself:", verdict)
         if code == 0:
@@ -572,10 +652,9 @@ def refine_cheap(maps, text, name, chosen, millis, test_ids, protected):
     sources = patched_library(maps, text)
     if sources is None:
         return chosen
-    before = os.times()
+    before = used()
     code, _ = run_tests(name, sources, [test_ids[n] for n in picked])
-    after = os.times()
-    spent_cpu = after[2] + after[3] - before[2] - before[3]
+    spent_cpu = used() - before
     verdict = {0: "all passed", 1: "a test failed"}.get(code, "no verdict (%s)" % code)
     log(name, "cpu %.1f" % spent_cpu, "ran", len(picked), "of", len(cheap), "cheap tests:", verdict)
     return sorted(result) if code == 0 else chosen
@@ -691,8 +770,9 @@ def main():
         log(name[:-6], len(chosen), "tests", len(workers), "workers")
         out.append(json.dumps({"commit": name[:-6], "workers": workers}, separators=(",", ":")))
     sys.stdout.write("".join(line + "\n" for line in out))
-    used = os.times()
-    log("cpu seconds: own %.2f, probes %.2f" % (used[0] + used[1], used[2] + used[3]))
+    stop_warm()
+    total = os.times()
+    log("cpu seconds: own %.2f, probes %.2f" % (total[0] + total[1], total[2] + total[3]))
 
 
 if __name__ == "__main__":
