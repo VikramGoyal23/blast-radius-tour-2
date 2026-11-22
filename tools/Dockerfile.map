@@ -1,0 +1,10 @@
+# Builds the image that traces sqlglot's tests at the pinned commit, in the
+# same Python image and package versions the commits were labeled in.
+FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
+ADD https://github.com/tobymao/sqlglot/archive/eb11aec4be8cb2122afe713a4816662c3f0fb2fa.tar.gz /tmp/sqlglot.tar.gz
+RUN mkdir /src && tar -xzf /tmp/sqlglot.tar.gz -C /src --strip-components=1 && rm /tmp/sqlglot.tar.gz
+COPY requirements.lock /tmp/requirements.lock
+RUN pip install --no-cache-dir -r /tmp/requirements.lock
+COPY tools /tools
+ENV BR_ROOT=/src BR_MAP=/out BR_WORK=/tmp/brwork
+CMD ["python", "/tools/build_map.py"]
