@@ -49,6 +49,7 @@ PROBE_TIMEOUT = 40
 WORKER_MS = 2000
 MAX_WORKERS = 8
 ALL = -1  # sentinel mask: every test
+NARROW = [False]  # when set, lookups use a line's users-only set where it has one
 
 # Files that configure the test run itself.
 GLOBAL_NAMES = {"conftest.py", "pytest.ini", "tox.ini", "setup.cfg", "pyproject.toml"}
@@ -67,6 +68,7 @@ class FileMap:
         self.hexsets = payload["sets"]
         self.line = payload["line"]
         self.dcall = payload["dcall"]
+        self.narrow = payload.get("narrow", {})
         self.users = int(payload["users"], 16)
         self.strs = payload["strs"]
         self.ints = {}
@@ -79,6 +81,10 @@ class FileMap:
 
     def mask(self, line):
         if 1 <= line <= len(self.line):
+            if NARROW[0]:
+                index = self.narrow.get(str(line))
+                if index is not None:
+                    return self.set(index)
             return self.set(self.line[line - 1])
         return self.users
 
@@ -412,7 +418,7 @@ def run_tests(name, sources, names):
     return code, failed
 
 
-def refine(maps, text, name, chosen, millis, test_ids, protected):
+def refine(maps, text, name, chosen, millis, test_ids, protected, to_numbers):
     """Cuts the map's selection down using what running cheap tests shows.
 
     The map says which tests a change can reach, not which it breaks. For a
@@ -430,9 +436,23 @@ def refine(maps, text, name, chosen, millis, test_ids, protected):
     """
     if not os.path.isdir(SRC) or time.monotonic() - STARTED > PROBE_DEADLINE:
         return chosen
-    slow = [n for n in chosen if millis[n] > SLOW_MS]
-    kept = [n for n in chosen if millis[n] <= SLOW_MS and (test_ids[n] in maps.pooled or n in protected)]
-    cheap = [n for n in chosen if millis[n] <= SLOW_MS and n not in set(kept)]
+    # A class-level edit in a dialect file reaches every test that loads the
+    # module, but only the dialect's users can observe it, provided the module
+    # still imports. A clean run proves that (it must load the patched module),
+    # so work on the users alone: on a clean run the rest go too.
+    pool = chosen
+    NARROW[0] = True
+    try:
+        tight = patch_mask(maps, text)
+    finally:
+        NARROW[0] = False
+    if tight != ALL:
+        users = set(to_numbers(tight)) | protected
+        if not users >= set(chosen):
+            pool = [n for n in chosen if n in users]
+    slow = [n for n in pool if millis[n] > SLOW_MS]
+    kept = [n for n in pool if millis[n] <= SLOW_MS and (test_ids[n] in maps.pooled or n in protected)]
+    cheap = [n for n in pool if millis[n] <= SLOW_MS and n not in set(kept)]
     cheap.sort(key=lambda n: (millis[n], n))
     if not cheap:
         return chosen
@@ -470,7 +490,8 @@ def refine(maps, text, name, chosen, millis, test_ids, protected):
     after = os.times()
     spent_cpu = after[2] + after[3] - before[2] - before[3]
     verdict = {0: "all passed", 1: "a test failed"}.get(code, "no verdict (%s)" % code)
-    log(name, "cpu %.1f" % spent_cpu, "ran", len(picked), "of", len(cheap), "cheap tests:", verdict)
+    scope = "users only, %d of %d" % (len(pool), len(chosen)) if pool is not chosen else "all reached"
+    log(name, "cpu %.1f" % spent_cpu, "ran", len(picked), "of", len(cheap), "cheap tests (%s):" % scope, verdict)
     return sorted(result) if code == 0 else chosen
 
 
@@ -577,7 +598,18 @@ def main():
             chosen = everything
         try:
             if maps is not None and chosen is not everything:
-                chosen = refine(maps, text, name[:-6], chosen, millis, test_ids, set(unknown))
+
+                def to_numbers(mask):
+                    found = []
+                    while mask:
+                        low = mask & -mask
+                        number = bit_to_number[low.bit_length() - 1]
+                        if number is not None:
+                            found.append(number)
+                        mask ^= low
+                    return found
+
+                chosen = refine(maps, text, name[:-6], chosen, millis, test_ids, set(unknown), to_numbers)
         except Exception as error:  # noqa: BLE001
             log(name, "kept the full selection:", repr(error))
         workers = split(chosen, millis)

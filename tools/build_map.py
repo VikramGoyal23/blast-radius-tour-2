@@ -504,9 +504,12 @@ def main():
                     refs[word] = refs.get(word, 0) | masks.base(number)
     log(len(expr), "expression classes; registry walkers:", bin(registry).count("1"))
 
-    # Off by default: a class-level edit that stops a dialect module importing
-    # breaks every test that loads it, not only the dialect's users.
-    group_users = dialect_users(built, classes) if os.environ.get("BR_DIALECT_NARROW") else {}
+    # A class-level edit in a dialect file can only be observed by the tests
+    # that use that dialect, unless it stops the module importing, which
+    # breaks every test that loads it. So the narrowed set is stored beside
+    # the safe one ("narrow"), and the selector only uses it after running
+    # tests against the patch has shown that the module still loads.
+    group_users = dialect_users(built, classes)
 
     total = 0
     written = []
@@ -524,25 +527,32 @@ def main():
 
         line_sets = []
         dcall = {}
+        narrow = {}
         for line in range(1, structure.n + 1):
             mask = masks.base(line)
             kind = structure.kind[line]
             key = (name, structure.cls[line])
             if kind != "f" and key in expr:
                 mask &= classes.get(name + "::" + key[1], 0) | refs.get(expr[key], 0) | registry
-            elif kind != "f" and group_of(name) in group_users:
-                mask &= group_users[group_of(name)]
+            tight = None
+            if kind != "f" and key not in expr and group_of(name) in group_users:
+                tight = mask & group_users[group_of(name)]
             if kind == "d":
                 called = masks.callers(line)
                 mask |= called
                 dcall[str(line)] = index(called)
+                if tight is not None:
+                    tight |= called
             line_sets.append(index(mask))
+            if tight is not None and tight != mask:
+                narrow[str(line)] = index(tight)
         payload = {
             "src": structure.source,
             "kind": "".join(structure.kind[1 : structure.n + 1]),
             "sets": [tohex(mask) for mask in order],
             "line": line_sets,
             "dcall": dcall,
+            "narrow": narrow,
             "users": tohex(masks.everyone),
             "strs": structure.strs,
         }
