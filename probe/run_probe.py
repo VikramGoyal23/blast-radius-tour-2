@@ -15,9 +15,26 @@ import sys
 import unittest
 
 
+def loaded_patched():
+    """0 if every patched module was loaded from its patched file, else 2."""
+    for module, (source, _) in json.loads(os.environ["BR_PATCH"]).items():
+        loaded = sys.modules.get(module)
+        if loaded is None or os.path.realpath(loaded.__file__) != os.path.realpath(source):
+            return 2
+    return 0
+
+
 def main():
     with open(sys.argv[1], encoding="utf-8") as handle:
         idents = json.load(handle)
+    if idents and idents[0] == "@tpcds":  # replay single queries of one test
+        import replay_tpcds
+
+        if not replay_tpcds.run(idents[1:]):
+            with open(os.environ["BR_REPORT"], "w", encoding="utf-8") as handle:
+                json.dump({"failed": ["@tpcds"]}, handle)
+            return 1
+        return loaded_patched()
     names = {}
     for ident in idents:
         path, cls, method = ident.split("::")
@@ -37,10 +54,8 @@ def main():
         return 1
     if result.unexpectedSuccesses or result.testsRun < len(names):
         return 2
-    for module, (source, _) in json.loads(os.environ["BR_PATCH"]).items():
-        loaded = sys.modules.get(module)
-        if loaded is None or os.path.realpath(loaded.__file__) != os.path.realpath(source):
-            return 2
+    if loaded_patched():
+        return 2
     with open(os.environ["BR_REPORT"], "w", encoding="utf-8") as handle:
         json.dump({"failed": sorted(failed)}, handle)
     return 1 if failed else 0

@@ -15,6 +15,7 @@ RUN grep -E '^(duckdb|numpy|pandas|python-dateutil|pytz|tzdata|mypy_extensions|t
     && pip install --no-cache-dir -r /tmp/probe.txt \
     && python -m compileall -q /app/src/sqlglot /app/src/tests
 COPY map /app/map
+COPY map_q /app/map_q
 COPY probe /app/probe
 COPY selector.py /app/selector.py
 CMD ["python", "-S", "-B", "/app/selector.py"]

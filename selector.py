@@ -44,6 +44,11 @@ RUN_BASE_MS = 400  # estimated CPU to start a test run
 RUN_RATE = 0.8  # estimated CPU per recorded test second
 # Tests measured to cost less CPU to run here than their recorded time: id -> CPU ms.
 OVERPRICED_MS = {"tests/test_generator.py::TestGenerator::test_generator_memory": 2600}
+TPCDS = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+QMAP = os.environ.get("BR_QMAP") or os.path.join(HERE, "map_q")  # which queries execute each line
+REPLAY_BASE_MS = 1300  # measured CPU to load the test's data before any query
+REPLAY_RATE = 0.65  # query costs were measured while tracing, which is slower
+REPLAY_ODDS = 0.6  # how often the test, once reached, still passes
 OVERPRICED_ODDS = 0.9  # how often such a test, once reached, still passes
 CLEAN_ODDS = 0.5  # how often a run is expected to come back clean
 NARROW_FILES = 3  # only edits this small are checked by running tests
@@ -103,8 +108,9 @@ class FileMap:
 
 
 class Maps:
-    def __init__(self):
-        with open(os.path.join(MAP, "index.json"), encoding="utf-8") as handle:
+    def __init__(self, root=None):
+        self.root = root or MAP
+        with open(os.path.join(self.root, "index.json"), encoding="utf-8") as handle:
             index = json.load(handle)
         self.tests = index["tests"]
         self.pooled = set(index.get("pooled", []))
@@ -117,7 +123,7 @@ class Maps:
         if name not in self.files:
             return None
         if name not in self.cache:
-            path = os.path.join(MAP, name.replace("/", "__") + ".json.gz")
+            path = os.path.join(self.root, name.replace("/", "__") + ".json.gz")
             with gzip.open(path, "rb") as handle:
                 self.cache[name] = FileMap(json.loads(handle.read().decode("utf-8")))
         return self.cache[name]
@@ -451,7 +457,7 @@ def stop_warm():
             pass
 
 
-def warm_run(modules, wanted, report, env):
+def warm_run(modules, wanted, report, env, timeout):
     """Runs the tests in a child forked from a process that already holds the
     heavy third-party imports (see probe/zygote.py). Returns the exit code,
     or None if the warm process cannot be used and a cold run should be made.
@@ -478,7 +484,7 @@ def warm_run(modules, wanted, report, env):
         if not started or started[0] != "pid":
             raise RuntimeError("no child")
         pid = int(started[1])
-        done = read_line(process, PROBE_TIMEOUT)
+        done = read_line(process, timeout)
         timed_out = done is None
         if timed_out:
             try:
@@ -497,7 +503,7 @@ def warm_run(modules, wanted, report, env):
         return None
 
 
-def run_tests(name, sources, names):
+def run_tests(name, sources, names, timeout=None):
     """Runs tests (by id) against the patched library in a child process.
 
     Returns (verdict, failed ids). Verdict 0: all passed. 1: some failed, and
@@ -526,7 +532,7 @@ def run_tests(name, sources, names):
         SKIP_INTEGRATION="0",
         PYTHONDONTWRITEBYTECODE="1",
     )
-    code = warm_run(modules, wanted, report, env)
+    code = warm_run(modules, wanted, report, env, timeout or PROBE_TIMEOUT)
     if code is None:  # cold run in a new interpreter
         code = -1
         child = None
@@ -540,7 +546,7 @@ def run_tests(name, sources, names):
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
             )
-            code = child.wait(timeout=PROBE_TIMEOUT)
+            code = child.wait(timeout=timeout or PROBE_TIMEOUT)
         except Exception as error:  # noqa: BLE001
             log(name, "test run did not finish:", repr(error))
         if child is not None:
@@ -568,7 +574,72 @@ def run_tests(name, sources, names):
 def refine(maps, text, name, chosen, millis, test_ids, protected):
     """The map's selection, cut down by what running tests against the patch shows."""
     chosen = refine_cheap(maps, text, name, chosen, millis, test_ids, protected)
-    return run_overpriced(maps, text, name, chosen, millis, test_ids)
+    chosen = run_overpriced(maps, text, name, chosen, millis, test_ids)
+    return replay_tpcds(maps, text, name, chosen, millis, test_ids)
+
+
+QUERY_MAPS = {}
+
+
+def query_maps():
+    """The per-query map of test_execute_tpcds, or None if it is not there."""
+    if "maps" not in QUERY_MAPS:
+        QUERY_MAPS["maps"] = QUERY_MAPS["costs"] = None
+        try:
+            maps = Maps(QMAP)
+            with open(os.path.join(QMAP, "costs.json"), encoding="utf-8") as handle:
+                QUERY_MAPS["costs"] = json.load(handle)
+            QUERY_MAPS["maps"] = maps
+        except Exception as error:  # noqa: BLE001
+            log("no per-query map:", repr(error))
+    return QUERY_MAPS["maps"], QUERY_MAPS["costs"]
+
+
+def replay_tpcds(maps, text, name, chosen, millis, test_ids):
+    """Checks test_execute_tpcds query by query instead of paying for all of it.
+
+    The test is 99 independent queries. A second map (map_q, built like the
+    main one) says which queries execute each line. When the test is still
+    selected, the queries a narrow patch can reach are replayed against the
+    patched code (probe/replay_tpcds.py); if all pass, the test is left out.
+    It stays in if the patch touches anything every query shares (imports,
+    set-up, class bodies), if no query is found to reach the change, or if
+    replaying would cost more than it is expected to save.
+    """
+    number = next((n for n in chosen if test_ids[n] == TPCDS), None)
+    if number is None or not os.path.isdir(SRC) or time.monotonic() - STARTED > PROBE_DEADLINE:
+        return chosen
+    qmaps, costs = query_maps()
+    if qmaps is None:
+        return chosen
+    mask = patch_mask(qmaps, text)
+    if mask == ALL or mask <= 0:
+        log(name, "tpcds kept: no query is known to reach the change")
+        return chosen
+    queries = []
+    for bit, label in enumerate(qmaps.tests):
+        if mask >> bit & 1:
+            if not label.startswith("tpcds::"):
+                log(name, "tpcds kept: the change is in code every query shares")
+                return chosen
+            queries.append(label[7:])
+    rest = [n for n in chosen if n != number]
+    saving = cost(chosen, millis) - cost(rest, millis)
+    price = REPLAY_BASE_MS + REPLAY_RATE * 1000 * sum(costs[q] for q in queries)
+    if REPLAY_ODDS * saving <= price:
+        log(name, "tpcds kept: replaying %d queries (%.1f s) is not worth %.1f s" % (len(queries), price / 1000, saving / 1000))
+        return chosen
+    sources = patched_library(maps, text)
+    if sources is None:
+        return chosen
+    queries.sort(key=lambda q: (costs[q], int(q)))  # cheapest first: a failure ends the run
+    before = used()
+    # A patch that makes a query hang must not burn the whole time limit.
+    limit = max(8, 3 * price / 1000)
+    code, _ = run_tests(name, sources, ["@tpcds"] + [int(q) for q in queries], limit)
+    verdict = {0: "all passed", 1: "one failed"}.get(code, "no verdict (%s)" % code)
+    log(name, "cpu %.1f" % (used() - before), "replayed", len(queries), "of", len(costs), "tpcds queries:", verdict)
+    return rest if code == 0 else chosen
 
 
 def run_overpriced(maps, text, name, chosen, millis, test_ids):
