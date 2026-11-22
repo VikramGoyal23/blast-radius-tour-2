@@ -41,6 +41,9 @@ PROBE_MIN = 5  # fewer passing tests than this vouch for nothing
 RUN_MS = int(os.environ.get("BR_RUN_MS", 8000))  # run every cheap test if they record less than this
 RUN_BASE_MS = 400  # estimated CPU to start a test run
 RUN_RATE = 0.8  # estimated CPU per recorded test second
+# Tests measured to cost less CPU to run here than their recorded time: id -> CPU ms.
+OVERPRICED_MS = {"tests/test_generator.py::TestGenerator::test_generator_memory": 2600}
+OVERPRICED_ODDS = 0.9  # how often such a test, once reached, still passes
 CLEAN_ODDS = 0.5  # how often a run is expected to come back clean
 NARROW_FILES = 3  # only edits this small are checked by running tests
 NARROW_LINES = 12
@@ -413,6 +416,41 @@ def run_tests(name, sources, names):
 
 
 def refine(maps, text, name, chosen, millis, test_ids, protected):
+    """The map's selection, cut down by what running tests against the patch shows."""
+    chosen = refine_cheap(maps, text, name, chosen, millis, test_ids, protected)
+    return run_overpriced(maps, text, name, chosen, millis, test_ids)
+
+
+def run_overpriced(maps, text, name, chosen, millis, test_ids):
+    """Runs, instead of selecting, a test that costs less CPU than it records.
+
+    A recorded time is what selecting a test costs. For a test listed in
+    OVERPRICED_MS, running it here is cheaper than that, so when one is still
+    selected we run it against the patch and leave it out if it passes.
+    """
+    if not os.path.isdir(SRC) or time.monotonic() - STARTED > PROBE_DEADLINE:
+        return chosen
+    by_name = {test_ids[n]: n for n in chosen if test_ids[n] in OVERPRICED_MS}
+    for ident, number in sorted(by_name.items()):
+        rest = [n for n in chosen if n != number]
+        saving = cost(chosen, millis) - cost(rest, millis)
+        if OVERPRICED_ODDS * saving <= OVERPRICED_MS[ident]:
+            continue
+        sources = patched_library(maps, text)
+        if sources is None:
+            return chosen
+        before = os.times()
+        code, _ = run_tests(name, sources, [ident])
+        after = os.times()
+        spent_cpu = after[2] + after[3] - before[2] - before[3]
+        verdict = {0: "passed", 1: "failed"}.get(code, "no verdict (%s)" % code)
+        log(name, "cpu %.1f" % spent_cpu, "ran", ident.split("::")[-1], "itself:", verdict)
+        if code == 0:
+            chosen = rest
+    return chosen
+
+
+def refine_cheap(maps, text, name, chosen, millis, test_ids, protected):
     """Cuts the map's selection down using what running cheap tests shows.
 
     The map says which tests a change can reach, not which it breaks. For a
