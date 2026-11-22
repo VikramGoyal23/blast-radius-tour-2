@@ -39,6 +39,9 @@ PROBE_DEADLINE = float(os.environ.get("BR_PROBE_DEADLINE", 100))  # seconds into
 STARTED = time.monotonic()
 PROBE_MIN = 5  # fewer passing tests than this vouch for nothing
 RUN_MS = int(os.environ.get("BR_RUN_MS", 8000))  # run every cheap test if they record less than this
+RUN_BASE_MS = 400  # estimated CPU to start a test run
+RUN_RATE = 0.8  # estimated CPU per recorded test second
+CLEAN_ODDS = 0.5  # how often a run is expected to come back clean
 NARROW_FILES = 3  # only edits this small are checked by running tests
 NARROW_LINES = 12
 PROBE_MAX = 40  # more tests than this mostly buys imports, not evidence
@@ -433,39 +436,42 @@ def refine(maps, text, name, chosen, millis, test_ids, protected):
     cheap.sort(key=lambda n: (millis[n], n))
     if not cheap:
         return chosen
-    total = sum(millis[n] for n in cheap)
-    run_all = total <= RUN_MS
-    if not run_all:
-        saving = cost(chosen, millis) - cost(kept + cheap, millis)
-        if not slow or saving < PROBE_WORTH_MS or len(cheap) < PROBE_MIN:
-            return chosen
-    sources = patched_library(maps, text)
-    if sources is None:
-        return chosen
-    if run_all:
-        picked = cheap
-    else:
+    # Two things running tests can buy, each paid for in CPU seconds:
+    #   probe    run the cheapest few; if all pass, the slow tests are dropped
+    #   run all  run every cheap test; if all pass, they are dropped as well
+    # A run stops at the first failure and then changes nothing, so its price
+    # is only worth paying against what a clean run would save.
+    full = cost(chosen, millis)
+    options = []
+    if slow and len(cheap) >= PROBE_MIN:
         picked, spent = [], 0
         for number in cheap:
             if len(picked) >= PROBE_MAX or (len(picked) >= PROBE_MIN and spent + millis[number] > PROBE_MS):
                 break
             picked.append(number)
             spent += millis[number]
-    by_name = {test_ids[n]: n for n in picked}
+        options.append((picked, kept + cheap))
+    after_all = list(kept) if len(cheap) >= PROBE_MIN else kept + slow
+    options.append((cheap, after_all))
+    best = None
+    for picked, result in options:
+        price = RUN_BASE_MS + RUN_RATE * sum(millis[n] for n in picked)
+        gain = CLEAN_ODDS * (full - cost(result, millis)) - price
+        if gain > 0 and (best is None or gain > best[0]):
+            best = (gain, picked, result)
+    if best is None:
+        return chosen
+    _, picked, result = best
+    sources = patched_library(maps, text)
+    if sources is None:
+        return chosen
     before = os.times()
-    code, failed = run_tests(name, sources, list(by_name))
+    code, _ = run_tests(name, sources, [test_ids[n] for n in picked])
     after = os.times()
     spent_cpu = after[2] + after[3] - before[2] - before[3]
-    log(name, "cpu %.1f" % spent_cpu, "ran" if run_all else "probed", len(picked), "tests:", {0: "all passed", 1: "%d failed" % len(failed)}.get(code, "no verdict (%s)" % code))
-    if code == 0:
-        # Nothing cheap broke. Slow tests go if enough cheap tests vouch for them.
-        result = list(kept) if run_all else kept + cheap
-        if len(picked) < PROBE_MIN:
-            result += slow
-        return sorted(result)
-    if code == 1 and run_all:
-        return sorted(kept + slow + [by_name[ident] for ident in failed])
-    return chosen
+    verdict = {0: "all passed", 1: "a test failed"}.get(code, "no verdict (%s)" % code)
+    log(name, "cpu %.1f" % spent_cpu, "ran", len(picked), "of", len(cheap), "cheap tests:", verdict)
+    return sorted(result) if code == 0 else chosen
 
 
 def patch_mask(maps, text):
