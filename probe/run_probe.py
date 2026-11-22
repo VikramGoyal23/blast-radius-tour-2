@@ -1,9 +1,11 @@
-"""Runs the named tests (pytest-style ids) against the patched checkout.
+"""Runs the tests listed in a JSON file (pytest-style ids) against the patched
+checkout and writes {"failed": [ids]} to BR_REPORT.
 
 Exit 0: every test passed and every patched module was really the one loaded.
-Exit 1: a test failed or errored. Exit 2: the run proves nothing (a patched
-module was never imported, or came from the wrong file). Anything but 0 makes
-the selector keep its full selection.
+Exit 1: some tests failed or errored; the report names them.
+Exit 2: the run proves nothing (a test could not be loaded or attributed, a
+patched module was never imported, or it came from the wrong file).
+Anything but 0 or 1 makes the selector keep its full selection.
 """
 
 import io
@@ -14,25 +16,37 @@ import unittest
 
 
 def main():
-    names = []
-    for ident in sys.argv[1:]:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        idents = json.load(handle)
+    names = {}
+    for ident in idents:
         path, cls, method = ident.split("::")
-        names.append(path[:-3].replace("/", ".") + "." + cls + "." + method)
-    suite = unittest.TestLoader().loadTestsFromNames(names)
+        names[path[:-3].replace("/", ".") + "." + cls + "." + method] = ident
+    suite = unittest.TestLoader().loadTestsFromNames(list(names))
     result = unittest.TextTestRunner(stream=io.StringIO(), verbosity=0).run(suite)
-    if not result.wasSuccessful() or result.testsRun < len(names):
-        for case, _ in (result.failures + result.errors)[:3]:
-            print("PROBE FAILED:", case, file=sys.stderr)
-        return 1
+    failed = set()
+    for case, _ in result.failures + result.errors:
+        case = getattr(case, "test_case", case)  # a failing subtest fails its test
+        ident = names.get(case.id()) if hasattr(case, "id") else None
+        if ident is None:
+            return 2  # a class or module level error: cannot say which tests
+        failed.add(ident)
+    if result.unexpectedSuccesses or result.testsRun < len(names):
+        return 2
     for module, (source, _) in json.loads(os.environ["BR_PATCH"]).items():
         loaded = sys.modules.get(module)
         if loaded is None or os.path.realpath(loaded.__file__) != os.path.realpath(source):
             return 2
-    return 0
+    with open(os.environ["BR_REPORT"], "w", encoding="utf-8") as handle:
+        json.dump({"failed": sorted(failed)}, handle)
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
-    code = main()
+    try:
+        code = main()
+    except BaseException:  # noqa: BLE001
+        code = 3
     sys.stdout.flush()
     sys.stderr.flush()
     os._exit(code)

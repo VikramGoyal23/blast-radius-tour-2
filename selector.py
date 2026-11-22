@@ -37,7 +37,10 @@ PROBE_MS = 1000  # recorded time of the cheap tests run as the check
 PROBE_WORTH_MS = 5000  # do not probe to save less than this
 PROBE_DEADLINE = float(os.environ.get("BR_PROBE_DEADLINE", 100))  # seconds into the run after which nothing is probed
 STARTED = time.monotonic()
-PROBE_MIN = 5
+PROBE_MIN = 5  # fewer passing tests than this vouch for nothing
+RUN_MS = int(os.environ.get("BR_RUN_MS", 8000))  # run every cheap test if they record less than this
+NARROW_FILES = 3  # only edits this small are checked by running tests
+NARROW_LINES = 12
 PROBE_MAX = 40  # more tests than this mostly buys imports, not evidence
 PROBE_TIMEOUT = 40
 WORKER_MS = 2000
@@ -314,8 +317,15 @@ def rebuilt(fmap, blocks):
 
 
 def patched_library(maps, text):
-    """{file: new source} if the patch only edits library modules, else None."""
+    """{file: new source} if the patch is a narrow edit of library modules.
+
+    Narrow means: only existing sqlglot/*.py files, no renames, deletions or
+    new files, and only a few changed lines. Running a handful of tests says
+    little about anything wider, so wider patches are never checked by
+    execution: they keep the map's full selection.
+    """
     sources = {}
+    changed = 0
     for entry in parse_patch(text):
         old, new = entry["old"], entry["new"]
         if entry["odd"] or entry["gone"] or entry["made"] or old != new or not old:
@@ -325,40 +335,20 @@ def patched_library(maps, text):
         fmap = maps.file(old)
         if fmap is None:
             return None
+        for _, removed, added in entry["blocks"]:
+            changed += len(removed) + len(added)
         sources[old] = rebuilt(fmap, entry["blocks"])
-    return sources or None
+    if not sources or len(sources) > NARROW_FILES or changed > NARROW_LINES:
+        return None
+    return sources
 
 
-def probe(maps, text, name, chosen, millis, test_ids, test_files):
-    """Returns the slow tests that may be dropped from `chosen` (maybe none).
+def run_tests(name, sources, names):
+    """Runs tests (by id) against the patched library in a child process.
 
-    A slow test is only worth its seconds if the change can break it. Run the
-    cheapest selected tests against the patched code first: if the change
-    breaks nothing among them, the slow tests reached through the same code
-    are left out. Any doubt (a failure, a crash, a timeout, a patched module
-    the probe never loaded) keeps them in.
+    Returns (verdict, failed ids). Verdict 0: all passed. 1: some failed, and
+    the list says which. Anything else: the run proves nothing.
     """
-    slow = [number for number in chosen if millis[number] > SLOW_MS]
-    if not slow or not os.path.isdir(SRC):
-        return []
-    cheap = sorted((n for n in chosen if millis[n] <= SLOW_MS), key=lambda n: (millis[n], n))
-    cheap_all = list(cheap)
-    # Tests that start worker processes cost far more CPU than they record.
-    cheap = [n for n in cheap if test_ids[n] not in maps.pooled]
-    saving = cost(chosen, millis) - cost(cheap_all, millis)
-    if saving < PROBE_WORTH_MS or time.monotonic() - STARTED > PROBE_DEADLINE:
-        return []
-    picked, total = [], 0
-    for number in cheap:
-        if len(picked) >= PROBE_MAX or (len(picked) >= PROBE_MIN and total + millis[number] > PROBE_MS):
-            break
-        picked.append(number)
-        total += millis[number]
-    if len(picked) < PROBE_MIN:
-        return []
-    sources = patched_library(maps, text)
-    if sources is None:
-        return []
     root = os.path.join(TMP, "probe-" + name)
     modules = {}
     for index, (path, source) in enumerate(sorted(sources.items())):
@@ -370,30 +360,33 @@ def probe(maps, text, name, chosen, millis, test_ids, test_files):
         if module.endswith(".__init__"):
             module = module[: -len(".__init__")]
         modules[module] = [target, os.path.join(SRC, os.path.dirname(path))]
+    report = os.path.join(root, "report.json")
+    wanted = os.path.join(root, "tests.json")
+    with open(wanted, "w", encoding="utf-8") as handle:
+        json.dump(names, handle)
     env = dict(os.environ)
     env.update(
         BR_PATCH=json.dumps(modules),
+        BR_REPORT=report,
         PYTHONPATH=PROBE + os.pathsep + SRC,
         SKIP_INTEGRATION="0",
         PYTHONDONTWRITEBYTECODE="1",
     )
-    names = [test_ids[number] for number in picked]
     code = -1
     child = None
-    errors = open(os.path.join(root, "stderr"), "w+b")
     try:
         # Its own process group, so worker processes the tests spawn die with it.
         child = subprocess.Popen(
-            [sys.executable, os.path.join(PROBE, "run_probe.py")] + names,
+            [sys.executable, os.path.join(PROBE, "run_probe.py"), wanted],
             cwd=SRC,
             env=env,
             stdout=subprocess.DEVNULL,
-            stderr=errors,
+            stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
         code = child.wait(timeout=PROBE_TIMEOUT)
     except Exception as error:  # noqa: BLE001
-        log(name, "probe did not finish:", repr(error))
+        log(name, "test run did not finish:", repr(error))
     if child is not None:
         try:
             os.killpg(child.pid, signal.SIGKILL)
@@ -403,15 +396,76 @@ def probe(maps, text, name, chosen, millis, test_ids, test_files):
             child.wait(timeout=5)
         except Exception:  # noqa: BLE001
             pass
-    if code != 0:
-        errors.seek(0)
-        for line in errors.read().decode("utf-8", "replace").splitlines():
-            if line.startswith("PROBE FAILED"):
-                log(name, line[:200])
-    errors.close()
+    failed = []
+    if code == 1:
+        try:
+            with open(report, encoding="utf-8") as handle:
+                failed = json.load(handle)["failed"]
+        except Exception:  # noqa: BLE001
+            code = -2
+        if code == 1 and (not failed or not set(failed) <= set(names)):
+            code = -3
     shutil.rmtree(root, ignore_errors=True)
-    log(name, "probe of", len(picked), "tests:", "clean" if code == 0 else "exit %s" % code)
-    return slow if code == 0 else []
+    return code, failed
+
+
+def refine(maps, text, name, chosen, millis, test_ids, protected):
+    """Cuts the map's selection down using what running cheap tests shows.
+
+    The map says which tests a change can reach, not which it breaks. For a
+    narrow edit we find out by running tests against the patched code:
+
+      run and report  if the cheap reachable tests are few, run them all and
+                      keep only the ones that fail;
+      probe           if they are many, run the cheapest few; when all pass,
+                      only the slow tests are dropped.
+
+    Slow tests (too dear to run here) stay only if a cheap test failed. Tests
+    that start worker processes are never run here and always stay. Any doubt
+    (crash, timeout, a patched module that was never loaded, an edit that is
+    not narrow) keeps the map's full selection.
+    """
+    if not os.path.isdir(SRC) or time.monotonic() - STARTED > PROBE_DEADLINE:
+        return chosen
+    slow = [n for n in chosen if millis[n] > SLOW_MS]
+    kept = [n for n in chosen if millis[n] <= SLOW_MS and (test_ids[n] in maps.pooled or n in protected)]
+    cheap = [n for n in chosen if millis[n] <= SLOW_MS and n not in set(kept)]
+    cheap.sort(key=lambda n: (millis[n], n))
+    if not cheap:
+        return chosen
+    total = sum(millis[n] for n in cheap)
+    run_all = total <= RUN_MS
+    if not run_all:
+        saving = cost(chosen, millis) - cost(kept + cheap, millis)
+        if not slow or saving < PROBE_WORTH_MS or len(cheap) < PROBE_MIN:
+            return chosen
+    sources = patched_library(maps, text)
+    if sources is None:
+        return chosen
+    if run_all:
+        picked = cheap
+    else:
+        picked, spent = [], 0
+        for number in cheap:
+            if len(picked) >= PROBE_MAX or (len(picked) >= PROBE_MIN and spent + millis[number] > PROBE_MS):
+                break
+            picked.append(number)
+            spent += millis[number]
+    by_name = {test_ids[n]: n for n in picked}
+    before = os.times()
+    code, failed = run_tests(name, sources, list(by_name))
+    after = os.times()
+    spent_cpu = after[2] + after[3] - before[2] - before[3]
+    log(name, "cpu %.1f" % spent_cpu, "ran" if run_all else "probed", len(picked), "tests:", {0: "all passed", 1: "%d failed" % len(failed)}.get(code, "no verdict (%s)" % code))
+    if code == 0:
+        # Nothing cheap broke. Slow tests go if enough cheap tests vouch for them.
+        result = list(kept) if run_all else kept + cheap
+        if len(picked) < PROBE_MIN:
+            result += slow
+        return sorted(result)
+    if code == 1 and run_all:
+        return sorted(kept + slow + [by_name[ident] for ident in failed])
+    return chosen
 
 
 def patch_mask(maps, text):
@@ -517,10 +571,9 @@ def main():
             chosen = everything
         try:
             if maps is not None and chosen is not everything:
-                drop = set(probe(maps, text, name[:-6], chosen, millis, test_ids, None))
-                chosen = [number for number in chosen if number not in drop]
+                chosen = refine(maps, text, name[:-6], chosen, millis, test_ids, set(unknown))
         except Exception as error:  # noqa: BLE001
-            log(name, "probe skipped:", repr(error))
+            log(name, "kept the full selection:", repr(error))
         workers = split(chosen, millis)
         log(name[:-6], len(chosen), "tests", len(workers), "workers")
         out.append(json.dumps({"commit": name[:-6], "workers": workers}, separators=(",", ":")))
