@@ -20,10 +20,26 @@ import gzip
 import json
 import os
 import re
+import shutil
+import signal
+import subprocess
 import sys
+import time
 
 DATA = os.environ.get("BR_DATA", "/data")
 MAP = os.environ.get("BR_MAP") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "map")
+HERE = os.path.dirname(os.path.abspath(__file__))
+SRC = os.environ.get("BR_SRC") or os.path.join(HERE, "src")  # pinned checkout
+PROBE = os.path.join(HERE, "probe")
+TMP = os.environ.get("TMPDIR", "/tmp")
+SLOW_MS = 3000  # a test dearer than this is checked before it is paid for
+PROBE_MS = 1000  # recorded time of the cheap tests run as the check
+PROBE_WORTH_MS = 5000  # do not probe to save less than this
+PROBE_DEADLINE = float(os.environ.get("BR_PROBE_DEADLINE", 100))  # seconds into the run after which nothing is probed
+STARTED = time.monotonic()
+PROBE_MIN = 5
+PROBE_MAX = 40  # more tests than this mostly buys imports, not evidence
+PROBE_TIMEOUT = 40
 WORKER_MS = 2000
 MAX_WORKERS = 8
 ALL = -1  # sentinel mask: every test
@@ -81,6 +97,7 @@ class Maps:
         with open(os.path.join(MAP, "index.json"), encoding="utf-8") as handle:
             index = json.load(handle)
         self.tests = index["tests"]
+        self.pooled = set(index.get("pooled", []))
         self.files = set(index["files"])
         self.opens = index["opens"]
         self.dirs = index["dirs"]
@@ -285,6 +302,118 @@ def parses(fmap, blocks):
     return True
 
 
+def rebuilt(fmap, blocks):
+    out = []
+    cursor = 0
+    for after, removed, added in blocks:
+        out.extend(fmap.old[cursor:after])
+        out.extend(added)
+        cursor = after + len(removed)
+    out.extend(fmap.old[cursor:])
+    return "\n".join(out)
+
+
+def patched_library(maps, text):
+    """{file: new source} if the patch only edits library modules, else None."""
+    sources = {}
+    for entry in parse_patch(text):
+        old, new = entry["old"], entry["new"]
+        if entry["odd"] or entry["gone"] or entry["made"] or old != new or not old:
+            return None
+        if not old.startswith("sqlglot/") or not old.endswith(".py"):
+            return None
+        fmap = maps.file(old)
+        if fmap is None:
+            return None
+        sources[old] = rebuilt(fmap, entry["blocks"])
+    return sources or None
+
+
+def probe(maps, text, name, chosen, millis, test_ids, test_files):
+    """Returns the slow tests that may be dropped from `chosen` (maybe none).
+
+    A slow test is only worth its seconds if the change can break it. Run the
+    cheapest selected tests against the patched code first: if the change
+    breaks nothing among them, the slow tests reached through the same code
+    are left out. Any doubt (a failure, a crash, a timeout, a patched module
+    the probe never loaded) keeps them in.
+    """
+    slow = [number for number in chosen if millis[number] > SLOW_MS]
+    if not slow or not os.path.isdir(SRC):
+        return []
+    cheap = sorted((n for n in chosen if millis[n] <= SLOW_MS), key=lambda n: (millis[n], n))
+    cheap_all = list(cheap)
+    # Tests that start worker processes cost far more CPU than they record.
+    cheap = [n for n in cheap if test_ids[n] not in maps.pooled]
+    saving = cost(chosen, millis) - cost(cheap_all, millis)
+    if saving < PROBE_WORTH_MS or time.monotonic() - STARTED > PROBE_DEADLINE:
+        return []
+    picked, total = [], 0
+    for number in cheap:
+        if len(picked) >= PROBE_MAX or (len(picked) >= PROBE_MIN and total + millis[number] > PROBE_MS):
+            break
+        picked.append(number)
+        total += millis[number]
+    if len(picked) < PROBE_MIN:
+        return []
+    sources = patched_library(maps, text)
+    if sources is None:
+        return []
+    root = os.path.join(TMP, "probe-" + name)
+    modules = {}
+    for index, (path, source) in enumerate(sorted(sources.items())):
+        target = os.path.join(root, str(index), os.path.basename(path))
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "w", encoding="utf-8", newline="") as handle:
+            handle.write(source)
+        module = path[:-3].replace("/", ".")
+        if module.endswith(".__init__"):
+            module = module[: -len(".__init__")]
+        modules[module] = [target, os.path.join(SRC, os.path.dirname(path))]
+    env = dict(os.environ)
+    env.update(
+        BR_PATCH=json.dumps(modules),
+        PYTHONPATH=PROBE + os.pathsep + SRC,
+        SKIP_INTEGRATION="0",
+        PYTHONDONTWRITEBYTECODE="1",
+    )
+    names = [test_ids[number] for number in picked]
+    code = -1
+    child = None
+    errors = open(os.path.join(root, "stderr"), "w+b")
+    try:
+        # Its own process group, so worker processes the tests spawn die with it.
+        child = subprocess.Popen(
+            [sys.executable, os.path.join(PROBE, "run_probe.py")] + names,
+            cwd=SRC,
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=errors,
+            start_new_session=True,
+        )
+        code = child.wait(timeout=PROBE_TIMEOUT)
+    except Exception as error:  # noqa: BLE001
+        log(name, "probe did not finish:", repr(error))
+    if child is not None:
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        try:
+            child.wait(timeout=5)
+        except Exception:  # noqa: BLE001
+            pass
+    if code != 0:
+        errors.seek(0)
+        for line in errors.read().decode("utf-8", "replace").splitlines():
+            if line.startswith("PROBE FAILED"):
+                log(name, line[:200])
+    errors.close()
+    shutil.rmtree(root, ignore_errors=True)
+    log(name, "probe of", len(picked), "tests:", "clean" if code == 0 else "exit %s" % code)
+    return slow if code == 0 else []
+
+
 def patch_mask(maps, text):
     mask = 0
     for entry in parse_patch(text):
@@ -310,6 +439,13 @@ def patch_mask(maps, text):
 
 
 # ------------------------------------------------------------------ workers
+
+
+def cost(numbers, millis):
+    workers = split(numbers, millis)
+    if not workers:
+        return 0
+    return max(sum(millis[n] for n in worker) for worker in workers) + WORKER_MS * len(workers)
 
 
 def split(numbers, millis):
@@ -340,6 +476,7 @@ def main():
     millis = {test["number"]: round(test["seconds"] * 1000) for test in tests}
     everything = sorted(millis)
     by_id = {test["id"]: test["number"] for test in tests}
+    test_ids = {test["number"]: test["id"] for test in tests}
 
     try:
         maps = Maps()
@@ -378,10 +515,18 @@ def main():
         except Exception as error:  # noqa: BLE001
             log(name, "fell back to every test:", repr(error))
             chosen = everything
+        try:
+            if maps is not None and chosen is not everything:
+                drop = set(probe(maps, text, name[:-6], chosen, millis, test_ids, None))
+                chosen = [number for number in chosen if number not in drop]
+        except Exception as error:  # noqa: BLE001
+            log(name, "probe skipped:", repr(error))
         workers = split(chosen, millis)
         log(name[:-6], len(chosen), "tests", len(workers), "workers")
         out.append(json.dumps({"commit": name[:-6], "workers": workers}, separators=(",", ":")))
     sys.stdout.write("".join(line + "\n" for line in out))
+    used = os.times()
+    log("cpu seconds: own %.2f, probes %.2f" % (used[0] + used[1], used[2] + used[3]))
 
 
 if __name__ == "__main__":

@@ -266,6 +266,137 @@ def expression_classes():
     return found
 
 
+DIALECT_DIRS = ("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/typing/")
+WORD = re.compile(r"[A-Za-z_]\w*")
+
+
+def group_of(name):
+    """The dialect a file belongs to (dialects/x.py, parsers/x.py, ... -> x)."""
+    if not name.startswith(DIALECT_DIRS):
+        return None
+    stem = name.rsplit("/", 1)[1][:-3]
+    return None if stem in ("__init__", "dialect", "base") else stem
+
+
+def dialect_users(built, classes):
+    """{dialect: tests that can observe its module- and class-level state}.
+
+    Such state is only reachable through an instance of one of the dialect's
+    classes (or a subclass), through code in its files, or through executed
+    code that names something the dialect defines. A dialect that imports
+    another one may copy its tables at import, so its users count as well, and
+    so does every test that loads any other file naming the dialect's
+    definitions at import time.
+    """
+    groups = {}
+    for name in built:
+        group = group_of(name)
+        if group:
+            groups.setdefault(group, []).append(name)
+    module_group = {}
+    for group, names in groups.items():
+        for name in names:
+            module_group[name[:-3].replace("/", ".")] = group
+    defined = {}  # top-level name -> groups defining it
+    imported = {group: set() for group in groups}  # group -> groups importing it
+    mentions = {}  # file -> line -> identifiers used there, imports excluded
+    for name, masks in built.items():
+        tree = ast.parse(masks.s.source)
+        mine = group_of(name)
+        table = mentions.setdefault(name, {})
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                targets = [alias.name for alias in node.names]
+                if isinstance(node, ast.ImportFrom) and node.module:
+                    targets += [node.module] + [node.module + "." + a.name for a in node.names]
+                for target in targets:
+                    other = module_group.get(target)
+                    if other and mine and other != mine:
+                        imported[other].add(mine)
+            elif isinstance(node, ast.Name):
+                table.setdefault(node.lineno, set()).add(node.id)
+            elif isinstance(node, ast.Attribute):
+                table.setdefault(node.end_lineno, set()).add(node.attr)
+        if mine:
+            for node in tree.body:
+                found = []
+                if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                    found = [node.name]
+                elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                    found = [t.id for t in targets if isinstance(t, ast.Name)]
+                for word in found:
+                    defined.setdefault(word, set()).add(mine)
+    # A name the library also defines outside the dialect files (an enum member,
+    # a helper of the same name) refers to that definition there, not to ours.
+    elsewhere = set()
+    for name, masks in built.items():
+        if group_of(name) or not name.startswith("sqlglot/"):
+            continue
+        for node in ast.walk(ast.parse(masks.s.source)):
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                elsewhere.add(node.name)
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                elsewhere.add(node.id)
+            elif isinstance(node, ast.arg):
+                elsewhere.add(node.arg)
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                module = getattr(node, "module", None) or ""
+                if module in module_group or any(a.name in module_group for a in node.names):
+                    log("NOTE: library file", name, "imports a dialect module at line", node.lineno)
+    owner = {
+        word: next(iter(owners))
+        for word, owners in defined.items()
+        if len(owners) == 1 and word not in elsewhere
+    }
+
+    users = {group: 0 for group in groups}
+    for key, mask in classes.items():
+        group = group_of(key.split("::")[0])
+        if group:
+            users[group] |= mask
+    loaders = {}  # file -> tests that ran its module level, i.e. imported it
+    for name, masks in built.items():
+        common = -1
+        for number in range(1, masks.s.n + 1):
+            if masks.s.kind[number] == "c" and masks.hits.get(number):
+                common &= masks.hits[number]
+        loaders[name] = common if common != -1 else masks.everyone
+    for name, masks in built.items():
+        structure = masks.s
+        mine = group_of(name)
+        for number, words in mentions[name].items():
+            if number > structure.n:
+                continue
+            runtime = structure.kind[number] == "f"
+            hit = masks.base(number) if runtime else masks.everyone
+            if runtime and mine and hit & loaders[name] != loaders[name]:
+                # (a function line every loader of the file ran is a helper
+                # called while the module was being imported: no evidence of use)
+                users[mine] |= hit
+            for word in words:
+                group = owner.get(word)
+                if group and group != mine:
+                    if runtime or not mine:
+                        if os.environ.get("BR_DEBUG") and bin(hit).count("1") > 600:
+                            log("  wide", group, name, number, word, "runtime" if runtime else "import")
+                        users[group] |= hit
+                    else:
+                        imported[group].add(mine)
+    changed = True
+    while changed:
+        changed = False
+        for group, others in imported.items():
+            for other in others:
+                merged = users[group] | users[other]
+                if merged != users[group]:
+                    users[group] = merged
+                    changed = True
+    for group in sorted(users):
+        log("dialect", group, "users:", bin(users[group]).count("1"), "importers:", sorted(imported[group]))
+    return users
+
+
 def tohex(mask):
     return "%x" % mask
 
@@ -275,11 +406,16 @@ def main():
     os.makedirs(OUT, exist_ok=True)
     files = test_files()
     log("tracing", len(files), "test files on", os.cpu_count(), "cpus")
-    with ThreadPoolExecutor(max_workers=os.cpu_count() or 2) as pool:
-        outs = list(pool.map(trace, files))
+    if os.environ.get("BR_SKIP_TRACE"):  # reuse traces from an earlier run
+        outs = [os.path.join(WORK, flat(name)) for name in files]
+    else:
+        jobs = int(os.environ.get("BR_JOBS") or os.cpu_count() or 2)
+        with ThreadPoolExecutor(max_workers=jobs) as pool:
+            outs = list(pool.map(trace, files))
 
     tests = []
     worker_counts = []
+    pooled = []
     untraced = []
     failed = []
     hits = {}  # file -> line -> mask
@@ -310,6 +446,8 @@ def main():
                 log("UNTRACED", record["id"], record["crashed"])
                 continue
             worker_counts.append(record.get("workers", 0))
+            if record.get("workers", 0) > 0:
+                pooled.append(record["id"])  # starts other Python processes
             if record.get("worker_errors"):
                 log("WORKER RECORD UNREADABLE for", record["id"])
             bit = 1 << len(tests)
@@ -366,6 +504,10 @@ def main():
                     refs[word] = refs.get(word, 0) | masks.base(number)
     log(len(expr), "expression classes; registry walkers:", bin(registry).count("1"))
 
+    # Off by default: a class-level edit that stops a dialect module importing
+    # breaks every test that loads it, not only the dialect's users.
+    group_users = dialect_users(built, classes) if os.environ.get("BR_DIALECT_NARROW") else {}
+
     total = 0
     written = []
     for name, masks in built.items():
@@ -388,6 +530,8 @@ def main():
             key = (name, structure.cls[line])
             if kind != "f" and key in expr:
                 mask &= classes.get(name + "::" + key[1], 0) | refs.get(expr[key], 0) | registry
+            elif kind != "f" and group_of(name) in group_users:
+                mask &= group_users[group_of(name)]
             if kind == "d":
                 called = masks.callers(line)
                 mask |= called
@@ -411,6 +555,7 @@ def main():
     index_payload = {
         "tests": tests,
         "untraced": untraced,
+        "pooled": pooled,
         "files": written,
         "opens": {name: tohex(mask) for name, mask in sorted(opens.items())},
         "dirs": {name: tohex(mask) for name, mask in sorted(dirs.items())},
