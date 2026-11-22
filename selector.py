@@ -258,7 +258,76 @@ def insertion_mask(fmap, after, code):
     return fmap.users
 
 
+SQUEEZE = str.maketrans({" ": None, "\t": None, "(": None, ")": None, ",": None, "\\": None, "'": '"'})
+FUTURE = "from __future__ import annotations"
+
+
+def squeeze(lines):
+    """Code lines with layout, brackets, quote style and trailing comments removed."""
+    out = []
+    for text in lines:
+        cut = text.find("#")
+        while cut != -1:
+            before = text[:cut]
+            if before.count('"') % 2 == 0 and before.count("'") % 2 == 0:
+                text = before
+                break
+            cut = text.find("#", cut + 1)
+        out.append(text.translate(SQUEEZE))
+    return "".join(out)
+
+
+def cosmetic(fmap, blocks):
+    """Does the patched file provably behave exactly like the original?
+
+    True when both parse to the same syntax tree: the edit only re-wraps
+    lines, adds brackets, changes quote style or comments. Annotations on
+    function parameters and results are left out of the comparison when the
+    module defers them (`from __future__ import annotations`): they are then
+    never evaluated, and nothing in sqlglot reads them back.
+
+    Parsing a file twice is not free, so two cheap tests on the changed lines
+    decide whether the comparison is worth making at all.
+    """
+    worth = False
+    for _, removed, added in blocks:
+        old_code = [text for _, text in removed if not noise(text)]
+        new_code = [text for text in added if not noise(text)]
+        if old_code == new_code:
+            continue
+        if squeeze(old_code) == squeeze(new_code):
+            worth = True
+            continue
+        headers = removed and all(fmap.kind_of(number) == "d" for number, text in removed if not noise(text))
+        if headers and len(old_code) == len(new_code) and any(":" in text or "->" in text for text in old_code):
+            worth = True
+            continue
+        return False
+    if not worth:
+        return False
+    old_source = "\n".join(fmap.old)
+    new_source = rebuilt(fmap, blocks)
+    try:
+        trees = [ast.parse(old_source), ast.parse(new_source)]
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return False
+    if FUTURE in old_source and FUTURE in new_source:
+        for tree in trees:
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    node.returns = None
+                    arguments = node.args
+                    for arg in arguments.posonlyargs + arguments.args + arguments.kwonlyargs:
+                        arg.annotation = None
+                    for arg in (arguments.vararg, arguments.kwarg):
+                        if arg is not None:
+                            arg.annotation = None
+    return ast.dump(trees[0]) == ast.dump(trees[1])
+
+
 def python_mask(fmap, blocks):
+    if cosmetic(fmap, blocks):
+        return 0
     mask = 0
     real = False
     for after, removed, added in blocks:
